@@ -1,13 +1,6 @@
-/*
-* STEPS TO START A SERVER
-    1. Create a socket
-    2. Set it's options
-    3. Bind it to a address(this is a tuple of port and IP address)
-    4. Start listening
-    5. Accept a connection, do something with it and close the connection.
-*/
-
-
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -18,37 +11,51 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-// handles communication to the client with the connected socket
-// static limits the visibility of the function to the file
-// in which it is defined
-static void do_something(int connfd) {
-    char rbuf[64] = {};
+// max request size
+const size_t MAX_MSG_SIZE = 4096;
 
-    // ssize_t - signed type to store the number of bytes read
-    // reads upto sizeof(rbuf) - 1 bytes to leave room for a null terminator
-    // read() returns the number of bytes read
-    // if (n == 0), it means that the client closed the connection
-    ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-    if (n < 0) {
-        perror("read() error");
-        return;    }
-    // add a null termination
-    rbuf[n] = '\0';
+static int32_t read_all(int connfd, char *buf, size_t n) {
+    while (n > 0) {
+        int rv = read(connfd, buf, n);
+        if (rv < 0) {
+            perror("read() error");
+            return -1;
+        }
+        else if (rv == 0) {
+            printf("EOF reached.");
+            return -1;
+        }
+        else {
+            // macro that checks if the conditions is true or false
+            // if false, throws an error and terminates the program
+            assert((size_t)rv <= n);
+            n -= (size_t)rv;
+            buf += rv;
+        }
+    }
+    return 0;
+}
 
-    printf("The client says: %s\n", rbuf);
-    ssize_t rv = 0;
-    if (strcmp(rbuf, "hello") == 0 || strcmp(rbuf, "Hello") == 0) {
-        char wbuf[] = "world";
-        rv = write(connfd, wbuf, sizeof(wbuf));
+static int32_t write_all(int connfd, char *buf, size_t n) {
+    while (n > 0) {
+        int rv = write(connfd, buf, n);
+        if (rv < 0) {
+            perror("write() error");
+            return -1;
+        }
+        else {
+            assert((size_t)rv <= n);
+            n -= (size_t)rv;
+            buf += rv;
+        }
     }
-    else {
-        char wbuf[] = "what are you talking about?";
-        rv = write(connfd, wbuf, sizeof(wbuf));
-    }
-    if (rv < 0) {
-        perror("write() error");
-    }
-    return;
+    return 0;
+}
+
+static int32_t one_request(int connfd) {
+    // 4 bytes len header
+    char rbuf[4 + MAX_MSG_SIZE + 1] = {};
+
 }
 
 int main() {
@@ -125,7 +132,11 @@ int main() {
             exit(EXIT_FAILURE);
         }
 
-        do_something(connfd);
+        // we can only serve one client connection at any time
+        // until we have (event loops)?
+        while (1) {
+            int32_t err = one_request(connfd);
+        }
         close(connfd);
     }
 
