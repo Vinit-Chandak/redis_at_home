@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -52,10 +53,46 @@ static int32_t write_all(int connfd, char *buf, size_t n) {
     return 0;
 }
 
+static bool isLittleEndian() {
+    uint32_t test = 1;
+    return (*((unsigned char *)&test) == 1);
+}
+
 static int32_t one_request(int connfd) {
-    // 4 bytes len header
+    // 4 bytes length header
     char rbuf[4 + MAX_MSG_SIZE + 1] = {};
 
+    int32_t rv = read_all(connfd, rbuf, 4);
+    if (rv) {
+        perror("Exiting due to read() error.");
+        exit(EXIT_FAILURE);
+    }
+
+    // we assume that the bytes are transmitted in network order format
+    // i.e big endian, so we check if the system is little endian and
+    // store accordingly
+    int32_t length = 0;
+    if (isLittleEndian()) {
+        length = (rbuf[3] << 24 | rbuf[2] << 16 | rbuf[1] << 8 | rbuf[0]);
+    }
+    else {
+        memcpy(&length, rbuf, 4);
+    }
+
+    rv = read_all(connfd, &rbuf[4], length);
+    if (rv) {
+        perror("Exiting due to read() error.");
+        exit(EXIT_FAILURE);
+    }
+    rbuf[4 + length] = '\0';
+    printf("The server says: %sn", &rbuf[4]);
+
+    char response[] = "Hi Server!";
+    char wbuf[4 + strlen(response)];
+    length = (uint32_t)strlen(response);
+    memcpy(&wbuf, &length, 4);
+    memcpy(&wbuf, &response, length);
+    return write_all(connfd, wbuf, 4 + length);
 }
 
 int main() {
