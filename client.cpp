@@ -15,7 +15,7 @@
 // max request size
 const size_t MAX_MSG_SIZE = 4096;
 
-static bool isLittleEndian() {
+static bool is_little_endian() {
   uint32_t test = 1;
   return (*(unsigned char *)&test) == 1;
 }
@@ -29,7 +29,7 @@ static bool isLittleEndian() {
  * @return int32_t the number of bytes read
  */
 static int32_t read_all(int connfd, char *buf, size_t n) {
-  size_t bytesRead = 0;
+  size_t bytes_read = 0;
   while (n > 0) {
     int rv = read(connfd, buf, n);
     if (rv < 0) {
@@ -40,11 +40,11 @@ static int32_t read_all(int connfd, char *buf, size_t n) {
     } else {
       assert((size_t)rv <= n);
       n -= (size_t)rv;
-      bytesRead += (size_t)rv;
+      bytes_read += (size_t)rv;
       buf += rv;
     }
   }
-  return bytesRead;
+  return bytes_read;
 }
 
 /**
@@ -86,11 +86,11 @@ int32_t query(int connfd, const char *message) {
   char wbuf[4 + length];
 
   // we need to send the data in network byte order
-  if (!isLittleEndian()) {
+  if (!is_little_endian()) {
     memcpy(&wbuf, &length, 4);
   } else {
-    int32_t networkLength = htonl(length);
-    memcpy(&wbuf, &networkLength, 4);
+    int32_t network_length = htonl(length);
+    memcpy(&wbuf, &network_length, 4);
   }
   memcpy(&wbuf[4], message, length);
   int32_t rv = write_all(connfd, wbuf, 4 + length);
@@ -113,7 +113,7 @@ int32_t query(int connfd, const char *message) {
 
   length = 0;
   memcpy(&length, rbuf, 4);
-  if (isLittleEndian()) {
+  if (is_little_endian()) {
     length = ntohl(length);
   }
   rv = read_all(connfd, &rbuf[4], length);

@@ -68,7 +68,7 @@ static int32_t write_all(int connfd, char *buf, size_t n) {
   return 0;
 }
 
-static bool isLittleEndian() {
+static bool is_little_endian() {
   uint32_t test = 1;
   return (*((unsigned char *)&test) == 1);
 }
@@ -122,11 +122,11 @@ static int32_t one_request(int connfd) {
   }
 
   // make sure to send the data in network byte order
-  if (!isLittleEndian()) {
+  if (!is_little_endian()) {
     memcpy(&wbuf, &length, 4);
   } else {
-    int32_t networkLength = htonl(length);
-    memcpy(&wbuf, &networkLength, 4);
+    int32_t network_length = htonl(length);
+    memcpy(&wbuf, &network_length, 4);
   }
   memcpy(&wbuf[4], response, length);
   return write_all(connfd, wbuf, 4 + length);
