@@ -43,7 +43,7 @@ partial reads/writes. Therefore we need to implement custom functions that conti
 desired number of bytes are read or written. Why partial read()/writes()?
 
 | **Scenario**             | **When It Happens**                                                                                                                                       | **Impacts `read()`?** | **Impacts `write()`?** |
-|---------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------|------------------------|
+|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------|------------------------|
 | **Network Buffering**     | Data available in the socket buffer is less than requested.                                                                                               | Yes                   | Yes                   |
 | **Interruptions**         | Signal interrupts the system call before it completes.                                                                                                    | Yes                   | Yes                   |
 | **Non-Blocking I/O**      | Socket/file is in non-blocking mode, and fewer bytes are immediately available for read/write.                                                             | Yes                   | Yes                   |
@@ -51,3 +51,9 @@ desired number of bytes are read or written. Why partial read()/writes()?
 | **End-of-File (EOF)**     | Reading beyond the end of the file or socket data stream.                                                                                                  | Yes                   | No                    |
 | **Output Buffer Full**    | The socket/file’s output buffer is full, preventing more data from being written.                                                                          | No                    | Yes                   |
 | **Flow Control (TCP)**    | TCP receiver signals the sender to slow down because its buffer is full.                                                                                  | No                    | Yes                   |
+
+Things to look up in this part:
+Blocking and Non Blocking System calls, EOF handling, when to user perror(), fprintf() etc.
+
+
+## Phase - 3
