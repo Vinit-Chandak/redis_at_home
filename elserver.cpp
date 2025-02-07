@@ -1,26 +1,25 @@
 #include <arpa/inet.h>
+#include <asm-generic/socket.h>
+#include <assert.h>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cerrno>
-#include <sys/socket.h>
 #include <sys/epoll.h>
-#include <asm-generic/socket.h>
-#include <netinet/in.h>
-#include <fcntl.h>
+#include <sys/socket.h>
 #include <unistd.h>
-#include <assert.h>
 
-#define LOG_ERROR(fmt) \
-  (fprintf(stderr, "[ERROR] %s:%d(): " \
-    fmt "\n", __FILE__, __LINE__))
+#define LOG_ERROR(fmt)                                                         \
+  (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n", __FILE__, __LINE__))
 
-#define LOG_SYS_ERROR(fmt) \
-  (fprintf(stderr, "[ERROR] %s:%d(): " \
-    fmt "\n%s\n", __FILE__, __LINE__, strerror(errno)))
+#define LOG_SYS_ERROR(fmt)                                                     \
+  (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n%s\n", __FILE__, __LINE__,       \
+           strerror(errno)))
 
 // maximum no of events epoll returns that are ready
 const int MAX_EVENTS = 10;
@@ -55,7 +54,7 @@ int main() {
   // bind
   struct sockaddr_in server_addr = {};
   server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htonl(3333);
+  server_addr.sin_port = htons(3333);
   server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   int rv = bind(fd, (const struct sockaddr *)&server_addr, sizeof(server_addr));
   if (rv < 0) {
@@ -113,17 +112,18 @@ int main() {
         struct sockaddr_in client_addr = {};
         socklen_t socklen = sizeof(client_addr);
 
-        int connfd = accept(fd, (struct sockaddr *)&client_addr, (socklen_t *)&socklen);
+        int connfd =
+            accept(fd, (struct sockaddr *)&client_addr, (socklen_t *)&socklen);
         if (connfd < 0) {
-          // if no pending connections are present on the queue
-          if (connfd == EAGAIN || connfd == EWOULDBLOCK) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // if no pending connections are present on the queue
             break;
           }
           LOG_ERROR("Error accepting the client connection.");
           break;
         }
         printf("Accepted connection from %s:%d \n",
-          inet_ntoa(client_addr.sin_addr), ntohl(client_addr.sin_port));
+               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
         // set the client connection fd to non blocking mode
         int rv = set_fd_nb(connfd);
@@ -135,35 +135,93 @@ int main() {
         // add the client connection fd to the interest list
         event.events = EPOLLIN | EPOLLOUT | EPOLLET;
         event.data.fd = connfd;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd, (struct epoll_event *)&event) < 0) {
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd,
+                      (struct epoll_event *)&event) < 0) {
           LOG_SYS_ERROR("Cannot put the client fd on the interest list");
           close(connfd);
           continue;
         }
       } else {
-        // if the fd is ready for a read operation
         if (events[i].events & EPOLLIN) {
+          // if the fd is ready for a read operation
           // since we are using edge triggered notifs
           // we need to read all the data as we might
           // not get subsequent notifications if some
           // data is left
-
-
+          char rbuf[MAX_MSG_SIZE + 4];
+          int rv = read(events[i].data.fd, rbuf, 4);
+          if (rv == 4) {
+            int32_t length = 0;
+            memcpy(&length, rbuf, 4);
+            length = ntohl(length);
+            if (length < MAX_MSG_SIZE) {
+              size_t n = length;
+              char * bufPtr = &rbuf[4];
+              while (n > 0) {
+                int rv = read(events[i].data.fd, bufPtr, length);
+                if (rv == 0) {
+                  printf("EOF reached. Client closed the connection.");
+                  break;
+                } else if (rv < 0) {
+                  if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                  } else {
+                    LOG_SYS_ERROR("read() error");
+                    break;
+                  }
+                } else {
+                  bufPtr += rv;
+                  n -= (size_t)rv;
+                }
+              }
+              printf("Client says: %s", rbuf);
+            } else {
+              LOG_ERROR("Message size exceeds the max limit.");
+              break;
+            }
+          } else {
+            if (rv == 0)
+              LOG_ERROR("EOF reached while reading the message length");
+            else if (rv < 0) {
+              LOG_SYS_ERROR("read() error");
+            }
+          }
         }
-        // if the fd is ready for a write operation
         if (events[i].events & EPOLLOUT) {
+          // if the fd is ready for a write operation
           // since we are using edge triggered notifs
           // we need to write all the data in one go
           // as we'll not be notified again until the
           // socket transitions from nto writable to
           // writable
-
+          char response[] = "hello, how you doin?";
+          int32_t length = strlen(response);
+          if (length > MAX_MSG_SIZE) {
+            LOG_ERROR("Message size exceeds the max limit");
+            continue;
+          }
+          length = htonl(length);
+          char wbuf[length + 4];
+          memcpy(&wbuf, &length, 4);
+          memcpy(&wbuf[4], response, length);
+          size_t n = length + 4;
+          char *message = wbuf;
+          while (n > 0) {
+            rv = write(events[i].data.fd, message, n);
+            if (rv < 0) {
+              if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+              else {
+                LOG_SYS_ERROR("write() error");
+                break;
+              }
+            } else {
+              n -= (size_t)rv;
+              message += rv;
+            }
+          }
         }
       }
     }
   }
-
-
-
-
 }
