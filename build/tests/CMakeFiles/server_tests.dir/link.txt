@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/server_tests.dir/server_test.cpp.o CMakeFiles/server_tests.dir/__/src/elserver.cpp.o -o server_tests   -L/home/linuxbrew/.linuxbrew/opt/googletest/lib  -Wl,-rpath,/home/linuxbrew/.linuxbrew/opt/googletest/lib -lgtest -lgtest_main -lpthread 

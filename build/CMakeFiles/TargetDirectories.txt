@@ -1,0 +1,5 @@
+/media/defoz3x/New Volume/redis_at_home/build/CMakeFiles/edit_cache.dir
+/media/defoz3x/New Volume/redis_at_home/build/CMakeFiles/rebuild_cache.dir
+/media/defoz3x/New Volume/redis_at_home/build/tests/CMakeFiles/server_tests.dir
+/media/defoz3x/New Volume/redis_at_home/build/tests/CMakeFiles/edit_cache.dir
+/media/defoz3x/New Volume/redis_at_home/build/tests/CMakeFiles/rebuild_cache.dir
