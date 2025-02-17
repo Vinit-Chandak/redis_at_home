@@ -1,8 +1,6 @@
 #include <arpa/inet.h>
-#include <asm-generic/socket.h>
 #include <assert.h>
 #include <cerrno>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -15,33 +13,70 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
+#include <string>
 
 using namespace std;
 
-#define LOG_ERROR(fmt)                                                         \
+// Logging macros
+#define LOG_ERROR(fmt) \
   (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n", __FILE__, __LINE__))
 
-#define LOG_SYS_ERROR(fmt)                                                     \
-  (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n%s\n", __FILE__, __LINE__,       \
+#define LOG_SYS_ERROR(fmt) \
+  (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n%s\n", __FILE__, __LINE__, \
            strerror(errno)))
 
-// maximum no of events epoll returns that are ready
-const int MAX_EVENTS = 10;
-const size_t MAX_MSG_SIZE = 1 << 10;
+// epoll-related
+static const int MAX_EVENTS = 10;
+
+// We treat MAX_MSG_SIZE as the maximum total size of request data
+// (i.e., nStr (4 bytes) sum of all per-string overhead (4 bytes each)
+// plus the actual string bytes must not exceed MAX_MSG_SIZE).
+static const size_t MAX_MSG_SIZE = 1 << 10;  // 1024
+
 volatile bool running = true;
 
-struct Connection {
-  int32_t fd;
-  size_t read_buffer_size = 0;
-  size_t write_buffer_size = 0;
-  size_t bytes_sent = 0;
-  char read_buffer[4 + MAX_MSG_SIZE];
-  char write_buffer[4 + MAX_MSG_SIZE];
+// Response statuses
+enum ResponseStatus {
+  SUCCESS,
+  UNKNOWN_COMMAND,
+  ERROR,
+  KEY_NOT_FOUND
 };
 
-struct epoll_event event, events[MAX_EVENTS];
-unordered_map<int, Connection *> fd2Connection;
+// A struct for the outcome of process_request
+struct RequestResponse {
+  ResponseStatus status;
+  std::string response;
+};
 
+// A per-connection object
+struct Connection {
+  int32_t fd;
+  size_t read_buffer_size;
+  size_t write_buffer_size;
+  size_t bytes_sent;
+  char read_buffer[MAX_MSG_SIZE];  // A buffer for reading
+  char write_buffer[MAX_MSG_SIZE]; // A buffer for queued writes
+
+  Connection() {
+    fd = -1;
+    read_buffer_size = 0;
+    write_buffer_size = 0;
+    bytes_sent = 0;
+    memset(read_buffer, 0, sizeof(read_buffer));
+    memset(write_buffer, 0, sizeof(write_buffer));
+  }
+};
+
+// Declarations of epoll event array and maps
+extern struct epoll_event event, events[MAX_EVENTS];
+extern std::unordered_map<int, Connection*> fd2Connection;
+extern std::unordered_map<std::string, std::string> kvStore;
+
+// -----------------------------------------------------------------------
+// set_fd_nb: sets fd to non-blocking mode
+// -----------------------------------------------------------------------
 int set_fd_nb(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) {
@@ -50,294 +85,397 @@ int set_fd_nb(int fd) {
   }
   flags |= O_NONBLOCK;
   if (fcntl(fd, F_SETFL, flags) == -1) {
-    LOG_SYS_ERROR("Error setting the fd to non-blocking mode");
+    LOG_SYS_ERROR("Error setting fd to non-blocking");
     return -1;
   }
   return 0;
 }
 
+// -----------------------------------------------------------------------
+// flush_write_buffer
+//   - If UNIT_TEST is defined, we stub out the actual writes
+//   - Otherwise, we do real non-blocking writes
+// -----------------------------------------------------------------------
 #ifdef UNIT_TEST
-// In unit tests, simply simulate a successful flush without doing actual I/O.
-int32_t flush_write_buffer(Connection *conn) {
-    // Simulate that all data in write_buffer was successfully "written."
-    conn->bytes_sent = conn->write_buffer_size;
-    conn->write_buffer_size = 0;
-    return 1;
+int32_t flush_write_buffer(Connection* conn) {
+  conn->bytes_sent = conn->write_buffer_size;
+  conn->write_buffer_size = 0;
+  return 1; // Pretend we wrote everything
 }
 #else
-int32_t flush_write_buffer(Connection *conn) {
-  int32_t rv = 0;
-  while (1) {
-    rv = write(conn->fd, conn->write_buffer + conn->bytes_sent,
-               conn->write_buffer_size - conn->bytes_sent);
-    if (rv < 0 && errno == EINTR)
+int32_t flush_write_buffer(Connection* conn) {
+  while (true) {
+    ssize_t rv = write(conn->fd,
+                       conn->write_buffer + conn->bytes_sent,
+                       conn->write_buffer_size - conn->bytes_sent);
+    if (rv < 0 && errno == EINTR) {
+      // retry
       continue;
-    else if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-      break;
-    else if (rv < 0) {
+    } else if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // can't write more, write buffer full
+      return 0;
+    } else if (rv < 0) {
       LOG_SYS_ERROR("Error writing to fd");
-      break;
+      return -1;
     } else if (rv == 0) {
-      break;
+      // client closed connection
+      return -1;
     } else {
-      conn->bytes_sent += static_cast<size_t>(rv);
+      // wrote rv bytes
+      conn->bytes_sent += rv;
+      if (conn->bytes_sent == conn->write_buffer_size) {
+        // done
+        conn->write_buffer_size = 0;
+        conn->bytes_sent = 0;
+        return 1;
+      }
     }
   }
-  conn->write_buffer_size -= conn->bytes_sent;
-  memmove(conn->write_buffer, conn->write_buffer + conn->bytes_sent,
-          conn->write_buffer_size);
-  conn->bytes_sent = 0;
-  if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-    return 0;
-  else if (rv < 0)
-    return -1;
-  else
-    return 1;
+  // never reached
+  return 1;
 }
 #endif
 
+// -----------------------------------------------------------------------
+// process_request: executes a command vector
+// -----------------------------------------------------------------------
+RequestResponse process_request(const std::vector<std::string>& command) {
+  RequestResponse response;
+  if (command.empty()) {
+    response.status = UNKNOWN_COMMAND;
+    response.response = "Unknown command\n";
+    return response;
+  }
 
-int32_t try_one_request(Connection *conn, char *start) {
+  if (command[0] == "set") {
+    if (command.size() != 3) {
+      response.status = ERROR;
+      response.response = "Invalid number of arguments\n";
+    } else {
+      kvStore[command[1]] = command[2];
+      response.status = SUCCESS;
+      response.response = "Set " + command[1] + " to " + command[2] + "\n";
+    }
+  } else if (command[0] == "get") {
+    if (command.size() != 2) {
+      response.status = ERROR;
+      response.response = "Invalid number of arguments\n";
+    } else {
+      auto it = kvStore.find(command[1]);
+      if (it == kvStore.end()) {
+        response.status = KEY_NOT_FOUND;
+        response.response = "Key not found\n";
+      } else {
+        response.status = SUCCESS;
+        response.response = it->second + "\n";
+      }
+    }
+  } else if (command[0] == "del") {
+    if (command.size() != 2) {
+      response.status = ERROR;
+      response.response = "Invalid number of arguments\n";
+    } else {
+      auto it = kvStore.find(command[1]);
+      if (it == kvStore.end()) {
+        response.status = KEY_NOT_FOUND;
+        response.response = "Key not found\n";
+      } else {
+        kvStore.erase(it);
+        response.status = SUCCESS;
+        response.response = "OK\n";
+      }
+    }
+  } else {
+    response.status = UNKNOWN_COMMAND;
+    response.response = "Unknown command\n";
+  }
+  return response;
+}
+
+// -----------------------------------------------------------------------
+// try_one_request: parse & process exactly one request from the buffer
+//   - returns 0 => partial request, need more data
+//   - returns >0 => consumed that many bytes (fully parsed request)
+//   - returns -1 => fatal error => close connection
+// -----------------------------------------------------------------------
+int32_t try_one_request(Connection* conn, char* start) {
+  // Need at least 4 bytes for nStr
   if (conn->read_buffer_size < 4) {
     printf("Not enough data to read\n");
     return 0;
   }
-  int32_t length;
-  memcpy(&length, start, 4);
-  length = ntohl(length);
-  if (length < 0 || length > MAX_MSG_SIZE) {
+  int32_t nStr;
+  memcpy(&nStr, start, 4);
+  nStr = ntohl(nStr);
+  start += 4;
+  int32_t consumed = 4;
+
+  if (nStr < 2 || nStr > 3) {
+    // fatal
+    const char msg[] = "Too many or too few arguments\n";
+    size_t off = conn->write_buffer_size;
+    int32_t msgLen = (int32_t)strlen(msg);
+    int32_t netLen = htonl(msgLen);
+    memcpy(conn->write_buffer + off, &netLen, 4);
+    memcpy(conn->write_buffer + off + 4, msg, msgLen);
+    conn->write_buffer_size += (4 + msgLen);
+    flush_write_buffer(conn);
     return -1;
   }
-  if (conn->read_buffer_size < (length + 4 + (start - conn->read_buffer))) {
-    printf("Not enough data to read\n");
-    return 0;
+
+  // We'll track how many bytes the "full request" is taking
+  size_t requestBytesSoFar = 4;
+
+  std::vector<std::string> command;
+  command.reserve(nStr);
+
+  for (int i = 0; i < nStr; i++) {
+    // Need 4 bytes for next string length
+    if ((conn->read_buffer + conn->read_buffer_size) - start < 4) {
+      printf("Not enough data to read\n");
+      return 0;
+    }
+    int32_t length;
+    memcpy(&length, start, 4);
+    length = ntohl(length);
+    start += 4;
+    consumed += 4;
+    requestBytesSoFar += 4; // overhead for length
+
+    // If the sum of lengths so far plus this string is > MAX_MSG_SIZE, fatal
+    if (requestBytesSoFar + length > MAX_MSG_SIZE) {
+      fprintf(stderr, "Oversized request\n");
+      flush_write_buffer(conn);
+      return -1;
+    }
+
+    // Check if enough leftover data for the string
+    if ((conn->read_buffer + conn->read_buffer_size) - start < length) {
+      printf("Not enough data to read\n");
+      return 0;
+    }
+
+    std::string val(start, length);
+    command.push_back(val);
+    start += length;
+    consumed += length;
+    requestBytesSoFar += length;
   }
-  printf("The client says: %.*s\n", length, start + 4);
-  if ((MAX_MSG_SIZE + 4) - conn->write_buffer_size < (length + 4)) {
-    printf("Write buffer full, cannot send a response to the client\n");
-  } else {
-    int32_t net_length = htonl(length);
-    memcpy(conn->write_buffer + conn->write_buffer_size, &net_length, 4);
-    conn->write_buffer_size += 4;
-    memcpy(conn->write_buffer + conn->write_buffer_size, (start + 4), length);
-    conn->write_buffer_size += length;
-    int32_t rv = flush_write_buffer(conn);
-  }
-  return length + 4;
+
+  // We have a complete command
+  RequestResponse resp = process_request(command);
+
+  // Append the response
+  size_t off = conn->write_buffer_size;
+  int32_t sz = (int32_t)resp.response.size();
+  int32_t net_sz = htonl(sz);
+  memcpy(conn->write_buffer + off, &net_sz, 4);
+  memcpy(conn->write_buffer + off + 4, resp.response.c_str(), sz);
+  conn->write_buffer_size += (4 + sz);
+
+  return consumed;
 }
 
-int32_t read_all(Connection *conn) {
-  int32_t rv;
-  while (1) {
-    size_t capacity = static_cast<size_t>(MAX_MSG_SIZE + 4) - conn->read_buffer_size;
-    rv = read(conn->fd, conn->read_buffer + conn->read_buffer_size, capacity);
-    if (rv < 0 && errno == EINTR)
+// -----------------------------------------------------------------------
+// read_all: repeatedly read from fd and parse requests
+//   - returns 0 => close connection
+//   - returns -1 => read error => also close
+//   - returns 1 => partial read but connection remains open
+// -----------------------------------------------------------------------
+int32_t read_all(Connection* conn) {
+  while (true) {
+    size_t capacity = sizeof(conn->read_buffer) - conn->read_buffer_size;
+    ssize_t rv = read(conn->fd,
+                      conn->read_buffer + conn->read_buffer_size,
+                      capacity);
+    if (rv < 0 && errno == EINTR) {
       continue;
-    else if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+    } else if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // no more data
       return 1;
-    else if (rv < 0) {
+    } else if (rv < 0) {
       LOG_SYS_ERROR("read() error");
       return -1;
     } else if (rv == 0) {
       printf("EOF, the client closed the connection\n");
       return 0;
     }
-    conn->read_buffer_size += static_cast<size_t>(rv);
-    char *start = conn->read_buffer;
-    while (1) {
+    // We read some data
+    conn->read_buffer_size += rv;
+
+    char* start = conn->read_buffer;
+    while (true) {
       int32_t consumed = try_one_request(conn, start);
       if (consumed > 0) {
         start += consumed;
       } else if (consumed == 0) {
+        // partial
         break;
       } else {
-        return false;
+        // consumed < 0 => fatal
+        return 0;
       }
     }
-    size_t processed = start - conn->read_buffer;
-    memmove(conn->read_buffer, start, processed);
-    conn->read_buffer_size -= processed;
+    // shift unconsumed data to front
+    size_t used = (size_t)(start - conn->read_buffer);
+    memmove(conn->read_buffer, start, conn->read_buffer_size - used);
+    conn->read_buffer_size -= used;
   }
-  return 1;
+  return 1; // unreachable
 }
 
 #ifndef UNIT_TEST
+// Global epoll-related
+struct epoll_event event, events[MAX_EVENTS];
+std::unordered_map<int, Connection*> fd2Connection;
+std::unordered_map<std::string, std::string> kvStore;
+
 int main() {
-  // create a socket
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
-    LOG_SYS_ERROR("Error creating a socket");
+    LOG_SYS_ERROR("Error creating socket");
     exit(EXIT_FAILURE);
   }
-
-  // set its options
   int val = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-  // bind
-  struct sockaddr_in server_addr = {};
+  struct sockaddr_in server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(3333);
   server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  int32_t rv =
-      bind(fd, (const struct sockaddr *)&server_addr, sizeof(server_addr));
-  if (rv < 0) {
-    LOG_SYS_ERROR("Error binding the socket");
+
+  if (bind(fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+    LOG_SYS_ERROR("bind() error");
     exit(EXIT_FAILURE);
   }
-
-  // set the listening fd to non-blocking mode
-  rv = set_fd_nb(fd);
-  if (rv < 0) {
+  if (set_fd_nb(fd) < 0) {
     exit(EXIT_FAILURE);
   }
-
-  // start listening for connections
-  rv = listen(fd, 10);
-  if (rv < 0) {
-    LOG_SYS_ERROR("listen() error, exiting");
+  if (listen(fd, 10) < 0) {
+    LOG_SYS_ERROR("listen() error");
     exit(EXIT_FAILURE);
   }
-  printf("Server listening on the port 3333\n");
+  printf("Server listening on port 3333\n");
 
-  // create an epoll instance
   int epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
-    LOG_SYS_ERROR("Error in creating an epoll instance");
+    LOG_SYS_ERROR("epoll_create1() error");
     exit(EXIT_FAILURE);
   }
 
-  // add the server socket to the epoll instance
-  // so that every time we have a request, we get
-  // notified
   event.events = EPOLLIN;
   event.data.fd = fd;
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-    LOG_SYS_ERROR("Error while registering server socket with epoll");
+    LOG_SYS_ERROR("epoll_ctl(ADD) server socket error");
     exit(EXIT_FAILURE);
   }
 
-  // event loop
   while (running) {
-    // wait for an I/O event on any of the fd in the interest list
-    int n = epoll_wait(epoll_fd, (struct epoll_event *)events, MAX_EVENTS, -1);
+    int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
     if (n < 0) {
-      LOG_SYS_ERROR("epoll_wait() error");
+      LOG_SYS_ERROR("epoll_wait error");
       break;
     }
     for (int i = 0; i < n; i++) {
-      // check if the event if for the server socket(i.e new connection)
       if (events[i].data.fd == fd) {
-        // accept a new client connection
-        struct sockaddr_in client_addr = {};
-        socklen_t socklen = sizeof(client_addr);
+        while (true) {
+          struct sockaddr_in client_addr;
+          socklen_t sz = sizeof(client_addr);
+          int connfd = accept(fd, (struct sockaddr*)&client_addr, &sz);
+          if (connfd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              break;
+            }
+            LOG_SYS_ERROR("accept() error");
+            break;
+          }
+          printf("Accepted connection from %s:%d\n",
+                 inet_ntoa(client_addr.sin_addr),
+                 ntohs(client_addr.sin_port));
 
-        int connfd =
-            accept(fd, (struct sockaddr *)&client_addr, (socklen_t *)&socklen);
-        if (connfd < 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // if no pending connections are present on the queue
+          if (set_fd_nb(connfd) < 0) {
+            close(connfd);
             continue;
           }
-          LOG_ERROR("Error accepting the client connection.");
-          continue;
+          struct epoll_event ev;
+          ev.events = EPOLLIN | EPOLLET;
+          ev.data.fd = connfd;
+          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd, &ev) < 0) {
+            LOG_SYS_ERROR("epoll_ctl(ADD) client error");
+            close(connfd);
+            continue;
+          }
+          Connection* c = new Connection;
+          c->fd = connfd;
+          fd2Connection[connfd] = c;
         }
-        printf("Accepted connection from %s:%d \n",
-               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        // set the client connection fd to non blocking mode
-        int32_t rv = set_fd_nb(connfd);
-        if (rv < 0) {
-          close(connfd);
-          continue;
-        }
-
-        // add the client connection fd to the interest list
-        event.events = EPOLLIN | EPOLLET;
-        event.data.fd = connfd;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connfd,
-                      (struct epoll_event *)&event) < 0) {
-          LOG_SYS_ERROR("Cannot put the client fd on the interest list");
-          close(connfd);
-          continue;
-        }
-
-        // create a connection state and add it to the map
-        Connection *conn = new Connection;
-        conn->fd = connfd;
-        fd2Connection[connfd] = conn;
-
       } else if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-        if (events[i].data.fd == fd) {
-          LOG_SYS_ERROR("epoll error in listning socket, exiting");
+        int cfd = events[i].data.fd;
+        if (cfd == fd) {
+          LOG_SYS_ERROR("epoll error on listening socket => exit");
           running = false;
         } else {
-          LOG_SYS_ERROR("epoll error in client fd, closing the connection");
-          Connection *conn = fd2Connection[events[i].data.fd];
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL) < 0) {
-            LOG_SYS_ERROR("epoll_ctl() DEL error");
+          LOG_SYS_ERROR("epoll error on client => close");
+          if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, cfd, nullptr) < 0) {
+            LOG_SYS_ERROR("epoll_ctl(DEL) error");
           }
-          close(conn->fd);
-          delete fd2Connection[conn->fd];
-          fd2Connection.erase(conn->fd);
+          close(cfd);
+          auto it = fd2Connection.find(cfd);
+          if (it != fd2Connection.end()) {
+            delete it->second;
+            fd2Connection.erase(it);
+          }
         }
       } else {
-        Connection *conn = fd2Connection[events[i].data.fd];
+        // handle read/write on existing client
+        int cfd = events[i].data.fd;
+        auto it = fd2Connection.find(cfd);
+        if (it == fd2Connection.end()) {
+          continue;
+        }
+        Connection* conn = it->second;
+
         if (events[i].events & EPOLLIN) {
-          // read the data from the fd into the connection buffer
-          int32_t rv = read_all(conn);
+          int rv = read_all(conn);
           if (rv <= 0) {
-            if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL) < 0) {
-              LOG_SYS_ERROR("epoll_ctl() DEL error");
-            }
-            close(conn->fd);
-            delete fd2Connection[conn->fd];
-            fd2Connection.erase(conn->fd);
-          } else {
-            if (conn->write_buffer_size == 0) {
-              struct epoll_event ev;
-              ev.events = EPOLLIN | EPOLLET;
-              ev.data.fd = conn->fd;
-              if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
-                LOG_SYS_ERROR("epoll_ctl() error");
-                close(conn->fd);
-                delete fd2Connection[conn->fd];
-                fd2Connection.erase(conn->fd);
-              }
-            }
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, cfd, nullptr);
+            close(cfd);
+            delete conn;
+            fd2Connection.erase(cfd);
+            continue;
           }
         }
+        // If we have data to write, enable EPOLLOUT
+        if (conn->write_buffer_size > 0) {
+          struct epoll_event ev;
+          ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+          ev.data.fd = cfd;
+          epoll_ctl(epoll_fd, EPOLL_CTL_MOD, cfd, &ev);
+        }
+
         if (events[i].events & EPOLLOUT) {
-          if (conn->write_buffer_size > 0) {
-            int32_t rv = flush_write_buffer(conn);
-            if (rv < 0) {
-              // if we get a write() error, we close the connection
-              if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL) < 0) {
-                LOG_SYS_ERROR("epoll_ctl() DEL error");
-              }
-              close(conn->fd);
-              delete fd2Connection[conn->fd];
-              fd2Connection.erase(conn->fd);
-            } else {
-              if (conn->write_buffer_size == 0) {
-                struct epoll_event ev;
-                ev.events = EPOLLIN | EPOLLET;
-                ev.data.fd = conn->fd;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
-                  LOG_SYS_ERROR("epoll_ctl() error");
-                  close(conn->fd);
-                  delete fd2Connection[conn->fd];
-                  fd2Connection.erase(conn->fd);
-                }
-              }
-            }
+          int wv = flush_write_buffer(conn);
+          if (wv < 0) {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, cfd, nullptr);
+            close(cfd);
+            delete conn;
+            fd2Connection.erase(cfd);
+          } else if (conn->write_buffer_size == 0) {
+            // turn off EPOLLOUT
+            struct epoll_event ev;
+            ev.events = EPOLLIN | EPOLLET;
+            ev.data.fd = cfd;
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, cfd, &ev);
           }
         }
       }
     }
   }
+
+  // cleanup
   for (auto it = fd2Connection.begin(); it != fd2Connection.end();) {
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, it->first, NULL);
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, it->first, nullptr);
     close(it->first);
     delete it->second;
     it = fd2Connection.erase(it);
