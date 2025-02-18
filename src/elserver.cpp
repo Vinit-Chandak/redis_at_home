@@ -15,64 +15,12 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include "elserver.h"
+#include "logging.h"
 
 using namespace std;
 
-// Logging macros
-#define LOG_ERROR(fmt) \
-  (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n", __FILE__, __LINE__))
-
-#define LOG_SYS_ERROR(fmt) \
-  (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n%s\n", __FILE__, __LINE__, \
-           strerror(errno)))
-
-// epoll-related
-static const int MAX_EVENTS = 10;
-
-// We treat MAX_MSG_SIZE as the maximum total size of request data
-// (i.e., nStr (4 bytes) sum of all per-string overhead (4 bytes each)
-// plus the actual string bytes must not exceed MAX_MSG_SIZE).
-static const size_t MAX_MSG_SIZE = 1 << 10;  // 1024
-
 volatile bool running = true;
-
-// Response statuses
-enum ResponseStatus {
-  SUCCESS,
-  UNKNOWN_COMMAND,
-  ERROR,
-  KEY_NOT_FOUND
-};
-
-// A struct for the outcome of process_request
-struct RequestResponse {
-  ResponseStatus status;
-  std::string response;
-};
-
-// A per-connection object
-struct Connection {
-  int32_t fd;
-  size_t read_buffer_size;
-  size_t write_buffer_size;
-  size_t bytes_sent;
-  char read_buffer[MAX_MSG_SIZE];  // A buffer for reading
-  char write_buffer[MAX_MSG_SIZE]; // A buffer for queued writes
-
-  Connection() {
-    fd = -1;
-    read_buffer_size = 0;
-    write_buffer_size = 0;
-    bytes_sent = 0;
-    memset(read_buffer, 0, sizeof(read_buffer));
-    memset(write_buffer, 0, sizeof(write_buffer));
-  }
-};
-
-// Declarations of epoll event array and maps
-extern struct epoll_event event, events[MAX_EVENTS];
-extern std::unordered_map<int, Connection*> fd2Connection;
-extern std::unordered_map<std::string, std::string> kvStore;
 
 // -----------------------------------------------------------------------
 // set_fd_nb: sets fd to non-blocking mode
@@ -80,12 +28,12 @@ extern std::unordered_map<std::string, std::string> kvStore;
 int set_fd_nb(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) {
-    LOG_SYS_ERROR("Error getting fd flags");
+    LOG_SYS_ERROR("error getting fd flags");
     return -1;
   }
   flags |= O_NONBLOCK;
   if (fcntl(fd, F_SETFL, flags) == -1) {
-    LOG_SYS_ERROR("Error setting fd to non-blocking");
+    LOG_SYS_ERROR("error setting fd to non-blocking");
     return -1;
   }
   return 0;
@@ -93,16 +41,9 @@ int set_fd_nb(int fd) {
 
 // -----------------------------------------------------------------------
 // flush_write_buffer
-//   - If UNIT_TEST is defined, we stub out the actual writes
-//   - Otherwise, we do real non-blocking writes
+//   - We do real non-blocking writes
 // -----------------------------------------------------------------------
-#ifdef UNIT_TEST
-int32_t flush_write_buffer(Connection* conn) {
-  conn->bytes_sent = conn->write_buffer_size;
-  conn->write_buffer_size = 0;
-  return 1; // Pretend we wrote everything
-}
-#else
+
 int32_t flush_write_buffer(Connection* conn) {
   while (true) {
     ssize_t rv = write(conn->fd,
@@ -115,7 +56,7 @@ int32_t flush_write_buffer(Connection* conn) {
       // can't write more, write buffer full
       return 0;
     } else if (rv < 0) {
-      LOG_SYS_ERROR("Error writing to fd");
+      LOG_SYS_ERROR("error writing to fd");
       return -1;
     } else if (rv == 0) {
       // client closed connection
@@ -134,7 +75,6 @@ int32_t flush_write_buffer(Connection* conn) {
   // never reached
   return 1;
 }
-#endif
 
 // -----------------------------------------------------------------------
 // process_request: executes a command vector
@@ -143,28 +83,28 @@ RequestResponse process_request(const std::vector<std::string>& command) {
   RequestResponse response;
   if (command.empty()) {
     response.status = UNKNOWN_COMMAND;
-    response.response = "Unknown command\n";
+    response.response = "unknown command\n";
     return response;
   }
 
   if (command[0] == "set") {
     if (command.size() != 3) {
       response.status = ERROR;
-      response.response = "Invalid number of arguments\n";
+      response.response = "invalid number of arguments, set requires two arguments\n";
     } else {
       kvStore[command[1]] = command[2];
       response.status = SUCCESS;
-      response.response = "Set " + command[1] + " to " + command[2] + "\n";
+      response.response = "set " + command[1] + " to " + command[2] + "\n";
     }
   } else if (command[0] == "get") {
     if (command.size() != 2) {
       response.status = ERROR;
-      response.response = "Invalid number of arguments\n";
+      response.response = "invalid number of arguments\n";
     } else {
       auto it = kvStore.find(command[1]);
       if (it == kvStore.end()) {
         response.status = KEY_NOT_FOUND;
-        response.response = "Key not found\n";
+        response.response = "key " + command[1] + " not found\n";
       } else {
         response.status = SUCCESS;
         response.response = it->second + "\n";
@@ -173,21 +113,21 @@ RequestResponse process_request(const std::vector<std::string>& command) {
   } else if (command[0] == "del") {
     if (command.size() != 2) {
       response.status = ERROR;
-      response.response = "Invalid number of arguments\n";
+      response.response = "invalid number of arguments, del requires one argument\n";
     } else {
       auto it = kvStore.find(command[1]);
       if (it == kvStore.end()) {
         response.status = KEY_NOT_FOUND;
-        response.response = "Key not found\n";
+        response.response = "key " + command[1] + " not found\n";
       } else {
         kvStore.erase(it);
         response.status = SUCCESS;
-        response.response = "OK\n";
+        response.response = "key " + command[1] + " deleted\n";
       }
     }
   } else {
     response.status = UNKNOWN_COMMAND;
-    response.response = "Unknown command\n";
+    response.response = "unknown command\n";
   }
   return response;
 }
@@ -201,7 +141,7 @@ RequestResponse process_request(const std::vector<std::string>& command) {
 int32_t try_one_request(Connection* conn, char* start) {
   // Need at least 4 bytes for nStr
   if (conn->read_buffer_size < 4) {
-    printf("Not enough data to read\n");
+    printf("not enough data to read\n");
     return 0;
   }
   int32_t nStr;
@@ -212,7 +152,7 @@ int32_t try_one_request(Connection* conn, char* start) {
 
   if (nStr < 2 || nStr > 3) {
     // fatal
-    const char msg[] = "Too many or too few arguments\n";
+    const char msg[] = "invalid command\n";
     size_t off = conn->write_buffer_size;
     int32_t msgLen = (int32_t)strlen(msg);
     int32_t netLen = htonl(msgLen);
@@ -232,7 +172,7 @@ int32_t try_one_request(Connection* conn, char* start) {
   for (int i = 0; i < nStr; i++) {
     // Need 4 bytes for next string length
     if ((conn->read_buffer + conn->read_buffer_size) - start < 4) {
-      printf("Not enough data to read\n");
+      printf("not enough data to read\n");
       return 0;
     }
     int32_t length;
@@ -244,14 +184,19 @@ int32_t try_one_request(Connection* conn, char* start) {
 
     // If the sum of lengths so far plus this string is > MAX_MSG_SIZE, fatal
     if (requestBytesSoFar + length > MAX_MSG_SIZE) {
-      fprintf(stderr, "Oversized request\n");
+      LOG_ERROR("oversized Request");
+      char response[] = "oversized request\n";
+      int32_t length = htonl(strlen(response));
+      memcpy(conn->write_buffer + conn->write_buffer_size, &length, 4);
+      memcpy(conn->write_buffer + conn->write_buffer_size + 4, response, strlen(response));
+      conn->write_buffer_size += (4 + strlen(response));
       flush_write_buffer(conn);
       return -1;
     }
 
     // Check if enough leftover data for the string
     if ((conn->read_buffer + conn->read_buffer_size) - start < length) {
-      printf("Not enough data to read\n");
+      printf("not enough data to read\n");
       return 0;
     }
 
@@ -324,7 +269,6 @@ int32_t read_all(Connection* conn) {
   return 1; // unreachable
 }
 
-#ifndef UNIT_TEST
 // Global epoll-related
 struct epoll_event event, events[MAX_EVENTS];
 std::unordered_map<int, Connection*> fd2Connection;
@@ -333,7 +277,7 @@ std::unordered_map<std::string, std::string> kvStore;
 int main() {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
-    LOG_SYS_ERROR("Error creating socket");
+    LOG_SYS_ERROR("error creating socket");
     exit(EXIT_FAILURE);
   }
   int val = 1;
@@ -356,7 +300,7 @@ int main() {
     LOG_SYS_ERROR("listen() error");
     exit(EXIT_FAILURE);
   }
-  printf("Server listening on port 3333\n");
+  printf("server listening on port 3333\n");
 
   int epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
@@ -390,7 +334,7 @@ int main() {
             LOG_SYS_ERROR("accept() error");
             break;
           }
-          printf("Accepted connection from %s:%d\n",
+          printf("accepted connection from %s:%d\n",
                  inet_ntoa(client_addr.sin_addr),
                  ntohs(client_addr.sin_port));
 
@@ -483,4 +427,3 @@ int main() {
   close(epoll_fd);
   return 0;
 }
-#endif

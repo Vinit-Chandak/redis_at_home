@@ -2,34 +2,40 @@
 #include <sys/socket.h>  // For socket functions
 #include <unistd.h>      // For close()
 #include <cstdlib>       // For EXIT_FAILURE, EXIT_SUCCESS, atoi()
-#include <cstring>       // For memcpy(), memset()
+#include <cstring>       // For memcpy(), memset(), strerror()
 #include <iostream>
 #include <vector>
 #include <string>
+#include "logging.h"
 
 // Hardcoded server address and port.
 const std::string SERVER_HOST = "127.0.0.1";
 const int SERVER_PORT = 3333;
 
 // Helper function to send all bytes over the socket.
-bool send_all(int sockfd, const char *buffer, size_t len) {
+bool send_all(int sockfd, const char* buffer, size_t len) {
     size_t total = 0;
     while (total < len) {
         ssize_t sent = send(sockfd, buffer + total, len - total, 0);
-        if (sent <= 0)
+        if (sent <= 0) {
+            // Use LOG_ERROR for a generic error message with no punctuation
+            LOG_ERROR("failed to send all bytes");
             return false;
+        }
         total += sent;
     }
     return true;
 }
 
 // Helper function to receive exactly 'len' bytes from the socket.
-bool recv_all(int sockfd, char *buffer, size_t len) {
+bool recv_all(int sockfd, char* buffer, size_t len) {
     size_t total = 0;
     while (total < len) {
         ssize_t recvd = recv(sockfd, buffer + total, len - total, 0);
-        if (recvd <= 0)
+        if (recvd <= 0) {
+            LOG_ERROR("failed to receive all bytes");
             return false;
+        }
         total += recvd;
     }
     return true;
@@ -39,7 +45,7 @@ bool recv_all(int sockfd, char *buffer, size_t len) {
 // The protocol format is as follows:
 //   - First 4 bytes: an integer (in network byte order) representing the number of strings in the command.
 //   - Then, for each token: 4 bytes for the string length (network order) followed by the string bytes.
-std::vector<char> build_request(const std::vector<std::string> &tokens) {
+std::vector<char> build_request(const std::vector<std::string>& tokens) {
     // Calculate the total size needed.
     size_t total_size = 4;  // For the string count.
     for (const auto &token : tokens) {
@@ -47,7 +53,7 @@ std::vector<char> build_request(const std::vector<std::string> &tokens) {
     }
 
     std::vector<char> request(total_size);
-    char *ptr = request.data();
+    char* ptr = request.data();
 
     // Write the number of strings.
     int32_t nTokens = tokens.size();
@@ -67,12 +73,16 @@ std::vector<char> build_request(const std::vector<std::string> &tokens) {
     return request;
 }
 
-int main(int argc, char *argv[]) {
-    // Expect at least one command-line argument (the command).
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <command> [arguments...]\n";
-        return EXIT_FAILURE;
-    }
+int main(int argc, char* argv[]) {
+      // Expect at least one command-line argument (the command).
+      if (argc < 2) {
+          // Construct an error message that includes argv[0].
+          char usageBuf[256];
+          snprintf(usageBuf, sizeof(usageBuf),
+                  "usage: %s <command> [arguments...]", argv[0]);
+          LOG_ERROR(usageBuf);
+          return EXIT_FAILURE;
+      }
 
     // Build the tokens vector from command line arguments.
     std::vector<std::string> tokens;
@@ -83,7 +93,8 @@ int main(int argc, char *argv[]) {
     // Create a socket.
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        perror("socket");
+        // Use LOG_SYS_ERROR to include strerror(errno).
+        LOG_SYS_ERROR("socket");
         return EXIT_FAILURE;
     }
 
@@ -93,14 +104,18 @@ int main(int argc, char *argv[]) {
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, SERVER_HOST.c_str(), &serv_addr.sin_addr) <= 0) {
-        std::cerr << "Invalid address: " << SERVER_HOST << std::endl;
+        // We log the invalid address string, starting with lowercase
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "invalid address: %s", SERVER_HOST.c_str());
+        LOG_ERROR(msg);
         close(sockfd);
         return EXIT_FAILURE;
     }
 
     // Connect to the server.
-    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("connect");
+    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        LOG_SYS_ERROR("connect() error");
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -108,16 +123,15 @@ int main(int argc, char *argv[]) {
     // Build the request message.
     std::vector<char> request = build_request(tokens);
     if (!send_all(sockfd, request.data(), request.size())) {
-        std::cerr << "Failed to send request.\n";
+        LOG_ERROR("failed to send request");
         close(sockfd);
         return EXIT_FAILURE;
     }
 
-    // Receive the response.
-    // First, read the 4-byte response length.
+    // Receive the response: first, read the 4-byte response length.
     char header[4];
     if (!recv_all(sockfd, header, 4)) {
-        std::cerr << "Failed to receive response header.\n";
+        LOG_ERROR("failed to receive response header");
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -125,7 +139,7 @@ int main(int argc, char *argv[]) {
     memcpy(&net_resp_length, header, 4);
     int32_t resp_length = ntohl(net_resp_length);
     if (resp_length < 0) {
-        std::cerr << "Invalid response length received.\n";
+        LOG_ERROR("invalid response length received");
         close(sockfd);
         return EXIT_FAILURE;
     }
@@ -133,12 +147,12 @@ int main(int argc, char *argv[]) {
     // Now receive the response payload.
     std::vector<char> resp(resp_length);
     if (!recv_all(sockfd, resp.data(), resp_length)) {
-        std::cerr << "Failed to receive response payload.\n";
+        LOG_ERROR("failed to receive response payload");
         close(sockfd);
         return EXIT_FAILURE;
     }
 
-    // Print the response.
+    // Print the response (assume it’s text).
     std::string response(resp.begin(), resp.end());
     std::cout << response;
 
