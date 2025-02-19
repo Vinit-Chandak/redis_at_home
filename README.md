@@ -129,18 +129,29 @@ We will implement 3 commands:
   set key value - set the value of the key
   del key - delete the key
 The command would be a list of strings. Both key and value will be strings.
+
 +------+-----+------+-----+------+-----+-----+------+
+
 | nstr | len | str1 | len | str2 | ... | len | strn |
+
 +------+-----+------+-----+------+-----+-----+------+
+
 The nstr is the number of strings and the len is the length of the following string. Both
 are 32-bit integers.
 The response is a 32-bit status code followed by the response string.
+
 +-----+---------+
+
 | res | data... |
+
 +-----+---------+
+
 EX:
+
 +--------+----------+--------+----------+--------+----------+--------+
+
 |  3     |   3      | "set"  |   3      | "key"  |   5      | "value"|
+
 +--------+----------+--------+----------+--------+----------+--------+
 
 
