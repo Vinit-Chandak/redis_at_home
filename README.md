@@ -156,5 +156,164 @@ EX:
 
 
 
+## Phase 5:
+Now we implement out custom hash table with progressive rehashing. Why can't we just use std::unordered_map?
+
+### 1.1 Why Hash Table Resizing Can Stall a Service:
+
+Hash tables need to expand periodically as you insert more elements to maintain a low load factor (i.e., the ratio of items to buckets). When std::unordered_map (and many other general-purpose implementations) crosses its load factor threshold, it typically:
+
+Allocates a bigger array (typically 2× the old size).
+Rehashes everything—meaning it iterates over every element in the old array and reinserts it into the new array in one big operation.
+This rehash step is O(N), where N is the total number of elements. If N is large (e.g., tens or hundreds of millions of entries), that rehash can take a significant amount of time. Because standard libraries assume relatively generic usage, they do the rehash as soon as it’s needed, all at once. This can be acceptable for programs where a stall of a few milliseconds (or even seconds) is tolerable. But in a service like Redis, which may run single-threaded and needs sub-millisecond latencies, blocking the entire server for a massive rehash can cause unavailability for clients.
+
+### 1.2 Why This Matters at Large Scale:
+
+Modern servers can easily have hundreds of gigabytes of RAM, which can hold very large hash tables. Even if rehashing a smaller dataset takes just milliseconds or seconds, rehashing a massive in-memory structure could stall the process for unacceptably long periods. A single operation that goes from microseconds to seconds can bring down the overall quality of service, causing timeouts and disconnects for many clients.
+
+### 1.3 How Progressive Resizing Works:
+
+Instead of rehashing everything all at once:
+
+Allocate a new, larger table in the background but do not immediately move all entries.
+Move a small portion of entries from the old table to the new table on each subsequent hash table operation. For example, whenever you do an insert, a lookup, or a delete, you also move a fixed number (say, a few hundred or thousand) of entries.
+Check both tables during lookups until all elements have migrated. Once the old table is fully transferred, deallocate it.
+This approach spreads the rehash cost across many smaller increments. Each increment is O(k) work, where k is the small batch of items moved, rather than O(N) in one shot. So, any individual operation may be slightly slower than normal during rehashing, but you avoid the catastrophic multi-second stall.
+
+### 1.4 Trade-Off: Higher Average Overhead but Lower Worst-Case:
+
+Pros:
+
+Eliminates the huge stall caused by a single monolithic O(N) rehash.
+Ensures the system remains responsive, maintaining strict latency requirements.
+
+Cons:
+
+During the resizing phase, each operation may have a small overhead because you have to check or move items incrementally.
+The code is more complex: you need logic for “migrate a few entries on each operation” and a strategy for lookups across two tables.
+From a worst-case latency perspective, this is a huge win. The worst-case cost is bounded by the small incremental batch size, rather than proportional to the total number of items N.
+
+### 1.5 Why Zero-Initialization Matters:
+
+Hash tables typically store metadata in each slot (for instance, whether the slot is occupied, a pointer to a node, or some other sentinel to indicate empty). If these need to be set to zero initially, performing a manual memset() on a multi-gigabyte array is expensive and immediate. For enormous tables, this initialization itself can stall the thread for a significant time.
+
+### 1.6 The Difference Between malloc() and calloc():
+
+malloc(size)
+
+Allocates a block of memory of size bytes but does not clear or zero it.
+If you want the memory zeroed, you’d typically do memset(ptr, 0, size), which forces an immediate O(size) pass over that memory.
+
+calloc(n, elem_size)
+
+Allocates space for n elements, each of elem_size bytes, and initializes all of it to zero.
+For large allocations, this can be done with the help of the OS in a way that defers the cost of zeroing until pages are actually accessed.
+
+### 1.7 How Large Allocations Use mmap():
+
+On Linux and similar Unix-like systems, when you calloc() a large block of memory (bigger than a threshold determined by the libc memory allocator), the runtime will typically use mmap() under the hood. The steps conceptually look like this:
+
+### 1.7.1 mmap() calls the kernel like this:
+
+void *ptr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+
+This reserves a range of virtual address space and marks it as readable and writable, but doesn’t physically allocate pages yet (beyond minimal bookkeeping).
+
+### 1.7.2 Zero pages with a copy-on-write strategy:
+
+The kernel often uses a special “zero page” that is mapped copy-on-write into the process’ address space. This means that until the process actually writes to a page in that region, the physical memory isn’t allocated, and the page is conceptually “all zeros” from the process’s perspective.
+
+### 1.7.3 calloc() ensures it is “logically zeroed”:
+
+Because the memory is mapped to zeroed pages, any read from that region sees zeros. The kernel defers real physical memory allocation (and any actual zeroing of pages) until the program writes to that page. This is referred to as demand paging.
+
+Thus, with a large calloc(), you don’t pay an immediate O(size) cost to zero out memory. It’s “backed” by a zero page until you touch it. As you progressively migrate keys or otherwise access the new table, individual pages become physically allocated and zero-initialized—but in small increments rather than all at once.
+
+### 4. Allocations Below the Threshold: Immediate Zeroing:
+
+For smaller allocations, the C library typically uses memory from the heap (often managed via brk() or small internal free lists) rather than calling mmap() directly. In these cases, calloc() usually must explicitly write zeros for the entire size. While that can still be an O(N) pass, it’s generally acceptable because “small” in this context is often just kilobytes or a few megabytes, not gigabytes. The threshold can vary (it might be on the order of tens or hundreds of kilobytes in glibc or other implementations), but the principle is:
+
+If it’s below a certain size, the runtime can zero out the memory quickly, and you pay that cost immediately.
+
+If it’s above that size, the runtime likely switches to mmap(), enabling demand paging.
+
+## Generic Collections in C:
+
+## 1. Use void* pointers:
+
+- Pros:
+    - Simple to code
+- Cons:
+    - Double indirection to access the data, first we have to access the void pointer and then the data.
+    - No compile time checking
+
+## 2. Generate code with C macros and code generators:
+
+C++ templates generate per-type code, which can be emulated with C macros.
+
+    #define DEFINE_NODE(T) struct Node_ ## T {
+        T data;
+        struct Node_ ## T *next;
+    }
+
+-> DEFINE_NODE(T):
+
+    struct Node_int {
+      int data;
+      struct Node_int *next;
+    }
+
+- this is very hard to debug and maintain, so not really useful.
+
+## 3. Intrusive Data Structures:
+
+### What we do usually:
+
+    template <class T>
+    struct Node {
+      T data;
+      struct Node *next;
+    }
+
+### What we can do usually:
+
+    struct Node {
+      struct Node *next;
+    }
+
+    struct MyData {
+      int data;
+      Node node; // embedded node structure in data struct
+      // more data
+    }
+
+### How is this generic?
+
+    size_t list_size (struct Node *node) {
+      size_t cnt = 0;
+      for (; node != NULL; node = node -> next) {
+        cnt++;
+      }
+      return cnt;
+    }
+
+  list_size() touches no data, it just works on the node structs.
+
+### How do we get the data back?
+
+  Just offset the address of the struct. Suppose you have a pointer *pnode to the node struct;
+
+    Node *pnode = some_ds_code();
+    MyData *pdata = (MyData *)((char *)pnode - offsetof(MyData, node));
+
+### Make this less verbose and error-prone with a macro:
+
+    #define container_of(ptr, T, member) ((T *)( (char *)ptr - offsetof(T, member) ))
+
+    MyData *pdata = container_of(pnode, MyData, node);
+
+  In C, offsetof(MyData, node) gives us the byte offset of node within MyData.
+
+
 
 #### Footnote - This readme is mostly for me to keep track of what I am doing, why and how.
