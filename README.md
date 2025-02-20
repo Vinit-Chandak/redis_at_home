@@ -250,69 +250,72 @@ If it’s above that size, the runtime likely switches to mmap(), enabling deman
 ## 2. Generate code with C macros and code generators:
 
 C++ templates generate per-type code, which can be emulated with C macros.
-
-    #define DEFINE_NODE(T) struct Node_ ## T {
-        T data;
-        struct Node_ ## T *next;
-    }
-
+  ~~~cpp
+  #define DEFINE_NODE(T) struct Node_ ## T {
+      T data;
+      struct Node_ ## T *next;
+  }
+  ~~~
 -> DEFINE_NODE(T):
-
-    struct Node_int {
-      int data;
-      struct Node_int *next;
-    }
-
+  ~~~cpp
+  struct Node_int {
+    int data;
+    struct Node_int *next;
+  }
+  ~~~
 - this is very hard to debug and maintain, so not really useful.
 
 ## 3. Intrusive Data Structures:
 
 ### What we do usually:
-
-    template <class T>
-    struct Node {
-      T data;
-      struct Node *next;
-    }
+  ~~~cpp
+  template <class T>
+  struct Node {
+    T data;
+    struct Node *next;
+  }
+  ~~~
 
 ### What we can do usually:
+  ~~~cpp
+  struct Node {
+    struct Node *next;
+  }
 
-    struct Node {
-      struct Node *next;
-    }
-
-    struct MyData {
-      int data;
-      Node node; // embedded node structure in data struct
-      // more data
-    }
+  struct MyData {
+    int data;
+    Node node; // embedded node structure in data struct
+    // more data
+  }
+  ~~~
 
 ### How is this generic?
-
-    size_t list_size (struct Node *node) {
-      size_t cnt = 0;
-      for (; node != NULL; node = node -> next) {
-        cnt++;
-      }
-      return cnt;
+  ~~~cpp
+  size_t list_size (struct Node *node) {
+    size_t cnt = 0;
+    for (; node != NULL; node = node -> next) {
+      cnt++;
     }
-
+    return cnt;
+  }
+~~~
   list_size() touches no data, it just works on the node structs.
 
 ### How do we get the data back?
 
   Just offset the address of the struct. Suppose you have a pointer *pnode to the node struct;
-
-    Node *pnode = some_ds_code();
-    MyData *pdata = (MyData *)((char *)pnode - offsetof(MyData, node));
-
+  ~~~cpp
+  Node *pnode = some_ds_code();
+  MyData *pdata = (MyData *)((char *)pnode - offsetof(MyData, node));
+  ~~~
 ### Make this less verbose and error-prone with a macro:
 
-    #define container_of(ptr, T, member) ((T *)( (char *)ptr - offsetof(T, member) ))
+  ~~~cpp
+  #define container_of(ptr, T, member) ((T *)( (char *)ptr - offsetof(T, member) ))
+  MyData *pdata = container_of(pnode, MyData, node);
+  ~~~
 
-    MyData *pdata = container_of(pnode, MyData, node);
-
-  In C, offsetof(MyData, node) gives us the byte offset of node within MyData.
+  In C, `offsetof(MyData, node)` gives us the byte offset of node within MyData.
 
 
 
