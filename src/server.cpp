@@ -12,7 +12,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define LOG_ERROR(fmt) \
+#define LOG_ERROR(fmt)                                                         \
   (fprintf(stderr, "[ERROR] %s:%d(): " fmt "\n", __FILE__, __LINE__))
 
 // max request size
@@ -59,7 +59,7 @@ static int32_t write_all(int connfd, char *buf, size_t n) {
     if (rv < 0) {
       perror("write() error");
       return -1;
-    }else {
+    } else {
       assert((size_t)rv <= n);
       n -= (size_t)rv;
       buf += rv;

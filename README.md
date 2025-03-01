@@ -256,7 +256,7 @@ C++ templates generate per-type code, which can be emulated with C macros.
       struct Node_ ## T *next;
   }
   ~~~
--> DEFINE_NODE(T):
+-> DEFINE_NODE(T):x
   ~~~cpp
   struct Node_int {
     int data;
